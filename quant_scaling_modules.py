@@ -61,6 +61,7 @@ class QuantEmbedding(nn.Module):
             weight_bit = 8,
             momentum = 0.95,
             quant_mode = False,
+            double_sided = False,
     ):
         super().__init__()
         self.num_ = num_embeddings
@@ -77,18 +78,25 @@ class QuantEmbedding(nn.Module):
             self.weight = _weight
 
         self.quant_mode = quant_mode
+        self.double_sided = double_sided
         #self.weight_function = QILQuantFunction.apply 
         self.weight_discretizer = QILWeightDiscretizer.apply
 
         self.bitW = weight_bit
-        self.c_W = nn.Parameter(torch.ones(2))
-        self.d_W = nn.Parameter(torch.ones(2))
-        self.gamma = nn.Parameter(torch.ones(1))
+        if double_sided:
+            # idx 0 is for negaitve value / idx 1 is for positive value
+            self.c_W = nn.Parameter(torch.ones(2))
+            self.d_W = nn.Parameter(torch.ones(2))
+            self.gamma = nn.Parameter(torch.ones(2))
+        else:
+            self.c_W = nn.Parameter(torch.ones(1))
+            self.d_W = nn.Parameter(torch.ones(1))
+            self.gamma = nn.Parameter(torch.ones(1))
         self.register_buffer("weight_quantize", torch.zeros_like(self.weight))
-        self.register_buffer("alpha_W", torch.zeros(1))
-        self.register_buffer("beta_W", torch.zeros(1))
-        self.register_buffer("weight_scaling_factor", torch.zeros(1))
-        self.register_buffer("weight_offset", torch.zeros(1))
+        self.register_buffer("alpha_W", torch.zeros_like(self.c_W))
+        self.register_buffer("beta_W", torch.zeros_like(self.c_W))
+        self.register_buffer("weight_scaling_factor", torch.zeros_like(self.c_W))
+        self.register_buffer("weight_offset", torch.zeros_like(self.c_W))
         self.epsilon = 1e-12
         self.weight_module_init = True
         self.act_init_mode = False
@@ -108,19 +116,28 @@ class QuantEmbedding(nn.Module):
                     self.scale_grad_by_freq,
                     self.sparse,
                 ), None, None
+        '''
         if self.d_W > self.c_W:
             self.d_W.data = self.c_W.data
-
-        assert self.c_W >= 0, "center parameter not be zero"
+        '''
+        self.d_W.data = torch.where(self.d_W > self.c_W, self.c_W.data, self.d_W.data)
+        assert torch.all(self.c_W >= 0), "center parameter not be zero"
         #transform
         data_type = torch.FloatTensor if x.device == torch.device("cpu")  else torch.cuda.FloatTensor
         self.alpha_W = 0.5 / (self.d_W )
         self.beta_W = -0.5 * self.c_W / (self.d_W ) + 0.5
         
-        self.weight_quantize = (self.alpha_W * torch.abs(self.weight) + self.beta_W)
-        self.weight_quantize = torch.clamp(self.weight_quantize, min = self.epsilon, max = 1.)
+        if self.double_sided:
+            self.weight_quantize = torch.where(self.weight < 0, self.alpha_W[0] * torch.abs(self.weight) + self.beta_W[0], self.alpha_W[1] * torch.abs(self.weight) + self.beta_W[1])
+        else:
+            self.weight_quantize = (self.alpha_W * torch.abs(self.weight) + self.beta_W)
+
+        self.weight_quantize = torch.clamp(self.weight_quantize, min = 0, max = 1.)
+
+        # if not use gamma
         #self.weight_quantize = torch.pow(self.weight_quantize, self.gamma) * torch.sign(self.weight)
-        self.weight_quantize = torch.where(self.weight_quantize > self.epsilon, self.weight_quantize ** self.gamma, self.weight_quantize * 0) 
+        #self.weight_quantize = torch.where(self.weight_quantize > self.epsilon, self.weight_quantize ** self.gamma, self.weight_quantize * 0) 
+
         self.weight_quantize = self.weight_discretizer(self.weight_quantize, self.bitW) * torch.sign(self.weight)
         self.weight_offset = self.c_W - self.d_W
         self.weight_scaling_factor = 2 * self.d_W
@@ -133,30 +150,48 @@ class QuantEmbedding(nn.Module):
                 scale_grad_by_freq = self.scale_grad_by_freq,
                 sparse = self.sparse,
         )
-        return (torch.abs(embed_quantize) * self.weight_scaling_factor + self.weight_offset) *\
-                torch.sign(embed_quantize), self.weight_scaling_factor, self.weight_offset
+        if self.double_sided:
+            embed_quantize = torch.where(embed_quantize < 0, torch.abs(embed_quantize) * self.weight_scaling_factor[0] + self.weight_offset[0],\
+                    torch.abs(embed_quantize) * self.weight_scaling_factor[1] + self.weight_offset[1]) * torch.sign(embed_quantize)
+        else:
+            embed_quantize = (torch.abs(embed_quantize) * self.weight_scaling_factor + self.weight_offset) * torch.sign(embed_quantize)
+        return embed_quantize, self.weight_scaling_factor, self.weight_offset
     
     def quantize_reset_parameter(self, args):
         w_abs = self.weight.abs().clone().detach()
-        if args.weight_init_mode == "min_max":
-            w_max = w_abs.max()
-            w_min = w_abs.min()
-            w_dx = (w_max + w_min).data / 2
-            w_dy = (w_max - w_min).data / 2
-        elif args.weight_init_mode == "topk":
-            w_abs = w_abs.reshape(-1).sort()[0]
-            w_top = w_abs[int(len(w_abs) * 0.7)].data
-            w_bottom = w_abs[0].data
+        if self.double_sided:
+            w_negative_max = self.weight[self.weight < 0].abs().max()
+            w_positive_max = self.weight[self.weight > 0].abs().max()
+            w_negative_min = 0
+            w_positive_min = 0
 
-            w_dx = (w_top + w_bottom) / 2
-            w_dy = (w_top - w_bottom) / 2
+            
+            self.c_W.data[0] = (w_negative_max + w_negative_min) / 2
+            self.c_W.data[1] = (w_positive_max + w_positive_min) / 2
+
+            self.d_W.data[0] = (w_negative_max - w_negative_min) / 2
+            self.d_W.data[1] = (w_positive_max - w_positive_min) / 2
+            print(w_positive_max, w_negative_max)
         else:
-            w_mean = w_abs.mean()
-            w_std = w_abs.std()
-            w_dx = w_mean.data
-            w_dy = w_std.data
-        self.c_W.data = torch.Tensor([w_dx]).to(self.weight.device)
-        self.d_W.data = torch.Tensor([w_dy]).to(self.weight.device)
+            if args.weight_init_mode == "min_max":
+                w_max = w_abs.max()
+                w_min = w_abs.min()
+                w_dx = (w_max + w_min).data / 2
+                w_dy = (w_max - w_min).data / 2
+            elif args.weight_init_mode == "topk":
+                w_abs = w_abs.reshape(-1).sort()[0]
+                w_top = w_abs[int(len(w_abs) * 0.7)].data
+                w_bottom = w_abs[0].data
+
+                w_dx = (w_top + w_bottom) / 2
+                w_dy = (w_top - w_bottom) / 2
+            else:
+                w_mean = w_abs.mean()
+                w_std = w_abs.std()
+                w_dx = w_mean.data
+                w_dy = w_std.data
+            self.c_W.data = torch.Tensor([w_dx]).to(self.weight.device)
+            self.d_W.data = torch.Tensor([w_dy]).to(self.weight.device)
     
     def box_plot(self, name):
         w_abs = self.weight.abs().reshape(-1).sort()[0].clone().detach().cpu().numpy()
@@ -336,14 +371,14 @@ class DuQGeLU(nn.Module):
         return quantized_act
 
 class QILQuantAct(nn.Module):
-    def __init__(self, bitA = 8, quant_mode = False, act_range_momentum = 0.95, per_group = False, num_groups = 12,channel_len = None):
+    def __init__(self, bitA = 8, quant_mode = False, act_range_momentum = 0.95, per_group = False, num_groups = 12,channel_len = None, double_sided = False):
         super().__init__()
 
         self.quant_mode = quant_mode
         self.act_range_momentum = act_range_momentum
         self.per_group = per_group
         self.num_groups = num_groups
-        self.percentile = False
+        self.double_sided = double_sided
 
         self.bitA = bitA
         self.act_discritizer = QILActDiscretizer.apply
@@ -353,12 +388,19 @@ class QILQuantAct(nn.Module):
         self.epsilon = 1e-12
  
         if self.per_group:
-            self.c_A = nn.Parameter(torch.zeros([num_groups, 1]))
-            self.d_A = nn.Parameter(torch.zeros([num_groups, 1]))
-
+            if self.double_sided:
+                self.c_A = nn.Parameter(torch.zeros([2,num_groups,1]))
+                self.d_A = nn.Parameter(torch.zeros([2,num_groups,1]))
+            else:
+                self.c_A = nn.Parameter(torch.zeros([num_groups, 1]))
+                self.d_A = nn.Parameter(torch.zeros([num_groups, 1]))
         else:
-            self.c_A = nn.Parameter(torch.zeros(1))
-            self.d_A = nn.Parameter(torch.zeros(1))
+            if self.double_sided:
+                self.c_A = nn.Parameter(torch.zeros(2, 1))
+                self.d_A = nn.Parameter(torch.zeros(2, 1))
+            else:
+                self.c_A = nn.Parameter(torch.zeros(1))
+                self.d_A = nn.Parameter(torch.zeros(1))
         
         self.register_buffer("act_scaling_factor", torch.zeros_like(self.c_A))
         self.register_buffer("act_offset", torch.zeros_like(self.c_A))
@@ -402,30 +444,44 @@ class QILQuantAct(nn.Module):
                 else :
                     raise NotImplementedError("input shape need to be 3-dimension or 2-dimension")
                 x_abs = x_abs.reshape(group_shape)
-                x_max = x_abs.amax(dim = argshape).reshape(self.num_groups, 1)
-                x_min = x_abs.amin(dim = argshape).reshape(self.num_groups, 1)
-                x_dx = (x_max + x_min).data / 2
-                x_dy = (x_max - x_min).data / 2
+                
+                if self.double_sided:
+                    # idx 0 --> negative, idx 1 --> positive
+                    x_negative_max = (x_abs * (x_act.reshape(group_shape) < 0)).amax(dim = argshape).reshape(self.num_groups, 1)
+                    x_positive_max = (x_abs * (x_act.reshape(group_shape) > 0)).amax(dim = argshape).reshape(self.num_groups, 1)
+                    x_dx = torch.zeros_like(self.c_A)
+                    x_dy = torch.zeros_like(self.c_A)
+
+                    x_dx.data[0] = (x_negative_max).data / 2
+                    x_dy.data[0] = (x_negative_max).data / 2
+                    x_dx.data[1] = (x_positive_max).data / 2
+                    x_dy.data[1] = (x_positive_max).data / 2
+
+                else:
+                    x_max = x_abs.amax(dim = argshape).reshape(self.num_groups, 1)
+                    x_min = x_abs.amin(dim = argshape).reshape(self.num_groups, 1)
+                    x_dx = (x_max + x_min).data / 2
+                    x_dy = (x_max - x_min).data / 2
             else:
-                if self.init_mode == "min_max":
+                if self.double_sided:
+                    x_negative_max = (x_abs[x_act < 0]).max()
+                    x_positive_max = (x_abs[x_act > 0]).max()
+
+                    x_dx = torch.zeros_like(self.c_A)
+                    x_dy = torch.zeros_like(self.c_A)
+
+                    x_dx.data[0] = x_nagative_max.data / 2
+                    x_dy.data[0] = x_negative_max.data / 2
+                    x_dx.data[1] = x_positive_max.data / 2
+                    x_dy.data[1] = x_positive_max.data / 2
+                else:
                     x_max = x_abs.max()
                     x_min = x_abs.min()
                     x_dx = (x_max + x_min).data /2 
                     x_dy = (x_max - x_min).data /2
-                elif self.init_mode == "topk":
-                    x_abs = x_abs.reshape(-1)
-                    x_abs = x_abs.sort()[0]
-                    x_top = x_abs[int(len(x_abs) * 0.95)].data
-                    x_bottom = x_abs[0].data
-                    x_dx = (x_top + x_bottom) / 2
-                    x_dy = (x_top - x_bottom) / 2
-                else:
-                    x_mean = x_abs.mean()
-                    x_std = x_abs.std()
-                    x_dx = x_mean.data
-                    x_dy = x_std.data
             self.c_A.data = ( 1 - self.act_range_momentum ) * self.c_A.data + self.act_range_momentum * x_dx.data
             self.d_A.data = ( 1 - self.act_range_momentum ) * self.d_A.data + self.act_range_momentum * x_dy.data
+            print(self.c_A.data, self.d_A.data)
     
         if not self.quant_mode:
             return x_act, None, None
@@ -436,9 +492,14 @@ class QILQuantAct(nn.Module):
         self.beta_A = -0.5 * self.c_A / (self.d_A +self.epsilon)+ 0.5
         self.act_offset = self.c_A - self.d_A
         self.act_scaling_factor = 2 * self.d_A
+
         if self.per_group:
             x_act = x_act.reshape(group_shape)
-        quantized_act = (self.alpha_A * torch.abs(x_act) + self.beta_A)
+
+        if self.double_sided:
+            quantized_act = torch.where(x_act < 0, torch.abs(x_act) * self.alpha_A[0,...] + self.beta_A[0,...], torch.abs(x_act) * self.alpha_A[1,...] + self.beta_A[1,...])
+        else:
+            quantized_act = (self.alpha_A * torch.abs(x_act) + self.beta_A)
         quantized_act = torch.clamp(quantized_act, min = 0., max = 1.)
         quantized_act = self.act_discritizer(quantized_act, self.bitA) * torch.sign(x_act)
         '''
@@ -455,7 +516,11 @@ class QILQuantAct(nn.Module):
                     identity_scaling_factor,
                     )
         '''
-        quantized_act = (torch.abs(quantized_act) * self.act_scaling_factor + self.act_offset) * torch.sign(quantized_act)
+        if self.double_sided:
+            quantized_act = torch.where(x_act < 0, torch.abs(quantized_act) * self.act_scaling_factor[0,...] + self.act_offset[0,...], torch.abs(quantized_act) * self.act_scaling_factor[1, ...] + self.act_offset[1, ...]) *\
+                    torch.sign(quantized_act)
+        else:
+            quantized_act = (torch.abs(quantized_act) * self.act_scaling_factor + self.act_offset) * torch.sign(quantized_act)
         if self.per_group:
             quantized_act = quantized_act.reshape(original_shape)
         return quantized_act, self.act_scaling_factor, self.act_offset
@@ -473,23 +538,33 @@ class QILLinear(nn.Module):
             Whether or not the layer is quantized.
     """
     def __init__(
-            self, in_features, out_features, bias = True, weight_bit = 8, bias_bit = 32, quant_mode = False, per_group = False, num_groups = 12
+            self, in_features, out_features, bias = True, weight_bit = 8, bias_bit = 32, quant_mode = False, per_group = False, num_groups = 12, double_sided = False,
         ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.per_group = per_group
         self.num_groups = num_groups
-        self.weight = nn.Parameter(torch.rand([out_features, in_features]))
+        self.double_sided = double_sided
+
+        self.weight = nn.Parameter(torch.randn([out_features, in_features]))
         self.register_buffer("weight_quantize", torch.zeros_like(self.weight))
 
         if self.per_group:
             assert out_features % num_groups == 0
-            self.c_W = nn.Parameter(torch.ones([num_groups, 1, 1]))
-            self.d_W = nn.Parameter(torch.ones([num_groups, 1, 1]))
+            if self.double_sided:
+                self.c_W = nn.Parameter(torch.ones([2, num_groups, 1, 1]))
+                self.d_W = nn.Parameter(torch.ones([2, num_groups, 1, 1]))
+            else:
+                self.c_W = nn.Parameter(torch.ones([num_groups, 1, 1]))
+                self.d_W = nn.Parameter(torch.ones([num_groups, 1, 1]))
         else:
-            self.c_W = nn.Parameter(torch.ones(1))
-            self.d_W = nn.Parameter(torch.ones(1))
+            if self.double_sided:
+                self.c_W = nn.Parameter(torch.ones([2, 1]))
+                self.d_W = nn.Parameter(torch.ones([2, 1]))
+            else:
+                self.c_W = nn.Parameter(torch.ones(1))
+                self.d_W = nn.Parameter(torch.ones(1))
 
         self.register_buffer("beta_W", torch.zeros_like(self.c_W))
         self.register_buffer("alpha_W", torch.zeros_like(self.c_W))
@@ -529,12 +604,21 @@ class QILLinear(nn.Module):
         self.weight_scaling_factor = 2 * self.d_W
         if self.per_group:
             self.weight_quantize = self.weight.reshape(self.num_groups,self.out_features // self.num_groups, self.in_features)
-            self.weight_quantize = (self.alpha_W * torch.abs(self.weight_quantize) + self.beta_W)
+            if self.double_sided:
+                self.weight_quantize = torch.where(self.weight_quantize < 0, self.alpha_W[0,...] * torch.abs(self.weight_quantize) + self.beta_W[0, ...], self.alpha_W[1, ...] * torch.abs(self.weight_quantize) + self.beta_W[1, ...])
+            else:
+                self.weight_quantize = (self.alpha_W * torch.abs(self.weight_quantize) + self.beta_W)
         else:
-            self.weight_quantize = (self.alpha_W * torch.abs(self.weight) + self.beta_W)
-        self.weight_quantize = torch.clamp(self.weight_quantize, min = self.epsilon, max = 1.)
-        self.weight_quantize = torch.where(self.weight_quantize > self.epsilon, self.weight_quantize ** self.gamma, \
-                self.weight_quantize * 0) 
+            if self.double_sided:
+                self.weight_quantize = torch.where(self.weight < 0, self.alpha_W[0,...] * torch.abs(self.weight) + self.beta_W[0, ...], self.alpha_W[1, ...] * torch.abs(self.weight) + self.beta_W[1, ...])
+            else:
+                self.weight_quantize = (self.alpha_W * torch.abs(self.weight) + self.beta_W)
+        # 일단 no gamma
+        #self.weight_quantize = torch.clamp(self.weight_quantize, min = self.epsilon, max = 1.)
+        self.weight_quantize = torch.clamp(self.weight_quantize, min = 0., max = 1.)
+        
+        #self.weight_quantize = torch.where(self.weight_quantize > self.epsilon, self.weight_quantize ** self.gamma, \
+        #        self.weight_quantize * 0) 
         self.weight_quantize = self.weight_discretizer(self.weight_quantize, self.bitW) * torch.sign(self.weight).reshape(self.weight_quantize.shape)
 
         #x_quantize = (( x.abs() - prev_act_offset ) / prev_act_scaling_factor) * torch.sign(x)
@@ -545,7 +629,11 @@ class QILLinear(nn.Module):
             self.bias_quantize = ( self.bias.abs()- self.bias_offset ) / self.bias_scaling_factor
             self.bias_quantize = self.weight_discretizer(self.bias_quantize, self.bias_bit)
         '''
-        self.weight_quantize = (self.weight_quantize.abs() * self.weight_scaling_factor + self.weight_offset) * torch.sign(self.weight_quantize)
+        if self.double_sided:
+            self.weight_quantize = torch.where(self.weight_quantize < 0, self.weight_quantize.abs() * self.weight_scaling_factor[0,...] + self.weight_offset[0,...], self.weight_quantize.abs() * self.weight_scaling_factor[1,...] + \
+                    self.weight_offset[1, ...]) * torch.sign(self.weight_quantize)
+        else:
+            self.weight_quantize = (self.weight_quantize.abs() * self.weight_scaling_factor + self.weight_offset) * torch.sign(self.weight_quantize)
         if self.per_group:
             self.weight_quantize = self.weight_quantize.reshape(self.weight.shape)
         return nn.functional.linear(x, weight = self.weight_quantize, bias = self.bias), None, None
@@ -554,30 +642,43 @@ class QILLinear(nn.Module):
     def quantize_reset_parameter(self,args):
         w_abs = self.weight.abs().clone().detach()
         if self.per_group:
-            w_abs = w_abs.reshape(self.num_groups, -1)   
-            w_max = w_abs.max(dim = -1, keepdim = True)[0]
-            w_min = w_abs.min(dim = -1, keepdim = True)[0]
-            w_dx = (w_max + w_min).unsqueeze(-1).data / 2
-            w_dy = (w_max - w_min).unsqueeze(-1).data / 2
+            if self.double_sided:
+                w_abs = w_abs.reshape(self.num_groups, -1)
+                w_negative_max = (w_abs * (self.weight.reshape(self.num_groups, -1) < 0)).max(dim = -1, keepdim = True)[0]
+                w_positive_max = (w_abs * (self.weight.reshape(self.num_groups, -1) > 0)).max(dim = -1, keepdim = True)[0]
+                
+                w_dx = torch.zeros_like(self.c_W)
+                w_dy = torch.zeros_like(self.c_W)
+
+                w_dx.data[0] = w_negative_max.unsqueeze(-1).data / 2
+                w_dy.data[0] = w_negative_max.unsqueeze(-1).data / 2
+
+                w_dx.data[1] = w_positive_max.unsqueeze(-1).data / 2
+                w_dy.data[1] = w_positive_max.unsqueeze(-1).data / 2
+            else:
+                w_abs = w_abs.reshape(self.num_groups, -1)   
+                w_max = w_abs.max(dim = -1, keepdim = True)[0]
+                w_min = w_abs.min(dim = -1, keepdim = True)[0]
+                w_dx = (w_max + w_min).unsqueeze(-1).data / 2
+                w_dy = (w_max - w_min).unsqueeze(-1).data / 2
         else:
-            if args.weight_init_mode == "min_max":
+            if self.double_sided:
+                w_negative_max = w_abs[self.weight < 0].max()
+                w_positive_max = w_abs[self.weight > 0].max()
+                
+                w_dx = torch.zeros_like(self.c_W)
+                w_dy = torch.zeros_like(self.d_W)
+            
+                w_dx.data[0] = w_negative_max.data / 2
+                w_dy.data[0] = w_negative_max.data / 2
+
+                w_dx.data[1] = w_positive_max.data / 2
+                w_dy.data[1] = w_positive_max.data / 2
+            else :
                 w_max = w_abs.max()
                 w_min = w_abs.min()
                 w_dx = torch.Tensor([(w_max + w_min).data / 2])
                 w_dy = torch.Tensor([(w_max - w_min).data / 2])
-            elif args.weight_init_mode == "topk":
-                w_abs = w_abs.reshape(-1)
-                w_abs = w_abs.sort()[0]
-                w_top = w_abs[int(len(w_abs) * 0.7)].data
-                w_bottom = w_abs[0].data
-
-                w_dx = torch.Tensor([(w_top + w_bottom) / 2])
-                w_dy = torch.Tensor([(w_top - w_bottom) / 2])
-            else:
-                w_mean = w_abs.mean()
-                w_std = w_abs.std()
-                w_dx = w_mean.data
-                w_dy = w_std.data
         self.c_W.data = w_dx.to(self.weight.device).data
         self.d_W.data = w_dy.to(self.weight.device).data
         print(self.c_W, self.d_W)
@@ -777,17 +878,17 @@ class testNet(nn.Module):
 '''
 if __name__ == "__main__":
     '''
-    Linear_test = QILLinear(10, 8, weight_bit = 2,per_group = False, num_groups = 8,quant_mode = True)
+    Linear_test = QILLinear(10, 8, weight_bit = 2,per_group = False, num_groups = 8,quant_mode = True, double_sided = True)
     print(Linear_test.weight)
-    print((Linear_test.weight.max(dim = -1)[0] - Linear_test.weight.min(dim = -1)[0]) /2)
+    print(Linear_test.weight[Linear_test.weight > 0].max(), Linear_test.weight[Linear_test.weight <0].min())
     args = None
     Linear_test.quantize_reset_parameter(args)
     x = torch.rand((1, 10))
     print(x, "x")
     print(Linear_test(x))
     '''
-    Act_test = QILQuantAct(bitA = 8, quant_mode = False, per_group = True, num_groups = 5)
-    x = torch.rand((2, 10))
+    Act_test = QILQuantAct(bitA = 2, quant_mode = False, per_group = True, num_groups = 5, double_sided = True)
+    x = torch.randn((2, 10))
     print(x)
     print(Act_test(x))
     Act_test.act_init_mode = True
@@ -796,4 +897,12 @@ if __name__ == "__main__":
     Act_test.quant_mode = True
     Act_test.act_init_mode = False
     y = Act_test(x)
-
+    print(y)
+    '''
+    embed_test = QuantEmbedding(50,10,quant_mode = True,double_sided = True)
+    print(embed_test.weight)
+    embed_test.quantize_reset_parameter(args = None)
+    print(embed_test.weight[embed_test.weight > 0].max())
+    print(embed_test.weight[embed_test.weight < 0].min())
+    print(embed_test(torch.ones([1], dtype = torch.int32))) 
+    '''

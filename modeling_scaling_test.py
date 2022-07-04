@@ -46,17 +46,19 @@ class QILBertEmbeddings(nn.Module):
         self.ln_input_bit = 22
         self.ln_output_bit = 32
         self.debug_mode = False
-
+        self.double_sided = config.double_sided
         self.word_embeddings = QuantEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 padding_idx=config.pad_token_id,
                 weight_bit=self.embedding_bit,
                 quant_mode=self.quant_mode,
+                double_sided = self.double_sided
         )
         self.token_type_embeddings = QuantEmbedding(
                 config.type_vocab_size, config.hidden_size, weight_bit = self.embedding_bit, 
-                quant_mode = self.quant_mode
+                quant_mode = self.quant_mode,
+                double_sided = self.double_sided,
         )
 
         # position_dis ( 1, len position emb ) is contiguous in memory and exported when serialized
@@ -71,6 +73,7 @@ class QILBertEmbeddings(nn.Module):
                 padding_idx = self.padding_idx,
                 weight_bit = self.embedding_bit,
                 quant_mode = self.quant_mode,
+                double_sided = self.double_sided,
         )
         
         # Quantization addition btw embeddings
@@ -83,7 +86,7 @@ class QILBertEmbeddings(nn.Module):
                 eps=config.layer_norm_eps,
         )
 
-        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
@@ -209,6 +212,7 @@ class QILBertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.double_sided = config.double_sided
         # Q, K, V Linear layers --> channel wise quantization도 고려해볼 만한듯
         self.query = QILLinear(
                 config.hidden_size,
@@ -219,6 +223,7 @@ class QILBertSelfAttention(nn.Module):
                 quant_mode = self.quant_mode,
                 per_group = config.group_wise,
                 num_groups = config.num_groups,
+                double_sided = self.double_sided,
                 )
         self.key = QILLinear(
                 config.hidden_size,
@@ -229,6 +234,7 @@ class QILBertSelfAttention(nn.Module):
                 quant_mode = self.quant_mode,
                 per_group = config.group_wise,
                 num_groups = config.num_groups,
+                double_sided = self.double_sided,
                 )
         self.value = QILLinear(
                 config.hidden_size,
@@ -239,13 +245,14 @@ class QILBertSelfAttention(nn.Module):
                 quant_mode = self.quant_mode,
                 per_group = config.group_wise,
                 num_groups = config.num_groups,
+                double_sided = self.double_sided,
                 )
         
         # Requantization ( 32bit -> 8bit ) for Q, K, V activations
-        self.query_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups)
-        self.key_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups)
-        self.value_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups)
-        self.output_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.query_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups, double_sided = self.double_sided)
+        self.key_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups, double_sided = self.double_sided)
+        self.value_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, per_group = config.group_wise, num_groups = config.num_groups, double_sided = self.double_sided)
+        self.output_activations = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -422,7 +429,7 @@ class QILBertSelfOutput(nn.Module):
         self.bias_bit = config.bias_bit
         self.ln_input_bit = 22
         self.ln_output_bit = 32
-
+        self.double_sided = config.double_sided
         self.dense = QILLinear(
             config.hidden_size,
             config.hidden_size,
@@ -431,13 +438,14 @@ class QILBertSelfOutput(nn.Module):
             bias_bit = self.bias_bit,
             quant_mode = self.quant_mode,
             #per_channel = True,
+            double_sided = self.double_sided
         )
         self.ln_input_act = QILQuantAct(self.ln_input_bit, quant_mode = False)
         self.LayerNorm = nn.LayerNorm(
                 config.hidden_size,
                 eps = config.layer_norm_eps
         )
-        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.debug_mode = False
     def forward(self, hidden_states, hidden_states_scaling_factor, hidden_states_offset, input_tensor,
@@ -522,6 +530,7 @@ class QILBertIntermediate(nn.Module):
         self.act_bit = config.act_bit
         self.weight_bit = config.weight_bit
         self.bias_bit = config.bias_bit
+        self.double_sided = config.double_sided
         self.dense = QILLinear(
                 config.hidden_size,
                 config.intermediate_size,
@@ -530,10 +539,11 @@ class QILBertIntermediate(nn.Module):
                 bias_bit = self.bias_bit,
                 quant_mode = self.quant_mode,
                 #per_channel = True,
+                double_sided = self.double_sided,
         )
         self.intermediate_act_fn = nn.GELU()
-        self.before_activation_quant = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
-        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.before_activation_quant = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
+        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
         self.debug_mode = False
 
     def forward(self, hidden_states, hidden_states_scaling_factor, hidden_states_offset):
@@ -571,7 +581,7 @@ class QILBertOutput(nn.Module):
         self.bias_bit = config.bias_bit
         self.ln_input_bit = 22
         self.ln_output_bit = 32
-
+        self.double_sided = config.double_sided
         self.dense = QILLinear(
                 config.intermediate_size,
                 config.hidden_size,
@@ -579,6 +589,7 @@ class QILBertOutput(nn.Module):
                 weight_bit = self.weight_bit,
                 bias_bit = self.bias_bit,
                 quant_mode = self.quant_mode,
+                double_sided = self.double_sided,
                 #per_channel = True,
         )
         self.ln_input_act = QILQuantAct(self.ln_input_bit, quant_mode = False)
@@ -586,7 +597,7 @@ class QILBertOutput(nn.Module):
                 config.hidden_size,
                 eps = config.layer_norm_eps,
                 )
-        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.output_activation = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.debug_mode = False
 
@@ -623,9 +634,9 @@ class QILBertLayer(nn.Module):
         self.attention = QILBertAttention(config)
         self.intermediate = QILBertIntermediate(config)
         self.output = QILBertOutput(config)
-
-        self.pre_intermediate_act = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
-        self.pre_output_act = QILQuantAct(self.act_bit, quant_mode = self.quant_mode)
+        self.double_sided = config.double_sided
+        self.pre_intermediate_act = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
+        self.pre_output_act = QILQuantAct(self.act_bit, quant_mode = self.quant_mode, double_sided = self.double_sided)
 
     def forward(
             self,

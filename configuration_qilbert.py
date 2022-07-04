@@ -84,6 +84,7 @@ class QILBertConfig(PretrainedConfig):
         group_wise = False,
         num_groups = 12,
         embedding_bit = 8,
+        double_sided = False,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -109,6 +110,7 @@ class QILBertConfig(PretrainedConfig):
         self.group_wise = group_wise
         self.num_groups = num_groups 
         self.embedding_bit = embedding_bit
+        self.double_sided = double_sided
 class IBertOnnxConfig(OnnxConfig):
     @property
     def inputs(self) -> Mapping[str, Mapping[int, str]]:

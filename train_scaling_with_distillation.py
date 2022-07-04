@@ -9,7 +9,7 @@ import random
 import time
 from dataclasses import field, dataclass, asdict
 from transformers import Trainer, TrainingArguments, AutoConfig, GlueDataTrainingArguments, AutoTokenizer, TrainerCallback
-from quant_modules import QuantEmbedding
+from quant_scaling_modules import QuantEmbedding
 import torch.optim as opt
 from torch.utils.data import DataLoader
 import argparse
@@ -19,7 +19,6 @@ import os
 import torch.nn as nn
 import torch.nn.functional as F
 from ray.tune.suggest.optuna import OptunaSearch
-import optuna
 import wandb
 
 class MyCallback(TrainerCallback):
@@ -107,6 +106,7 @@ def arg_parse():
     parser.add_argument('--group_wise', action = 'store_true')
     parser.add_argument('--num_groups', default = 12, type = int)
     parser.add_argument('--embedding_bit','-e', default = 8, type = int)
+    parser.add_argument('--double_sided', action = 'store_true')
     args = parser.parse_args()
     return args
 
@@ -150,13 +150,13 @@ def get_teacher_model():
 def get_model(config):
 
     bert_config = QILBertConfig(weight_bit = args.weight_bit, act_bit = args.act_bit, embedding_bit = args.embedding_bit, group_wise = args.group_wise, num_groups = args.num_groups,
-                                quant_mode = args.quant_mode)
+                                quant_mode = args.quant_mode, double_sided=args.double_sided)
     if args.quant_mode:
         model = QILBertForSequenceClassification(bert_config)
         check_point = torch.load(os.path.join(args.directory, 'pytorch_model.bin'))
         if args.init_param:
             for key, value in check_point.copy().items():
-                if "c_W" in key or "c_A" in key or "d_W" in key or "d_A" in key:
+                if (not "weight" in key ) or (not "bias" in key):
                     check_point.pop(key)
             model.load_state_dict(check_point, strict = False)
             model.eval()
